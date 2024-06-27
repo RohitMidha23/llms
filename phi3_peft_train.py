@@ -3,76 +3,73 @@ import os
 os.environ["HF_HOME"] = "/vol/bitbucket/rm1623/.cache/"
 
 import os
+from typing import List, Optional, Tuple, Union
+
 import torch
+import torch.nn as nn
+import wandb
 from datasets import load_dataset
+from peft import LoraConfig, PeftModel
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     HfArgumentParser,
+    Phi3Model,
+    Phi3PreTrainedModel,
     TrainingArguments,
-    pipeline,
     logging,
+    pipeline,
 )
-from peft import LoraConfig, PeftModel
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from trl import SFTTrainer
 
-import wandb
 
-from typing import Optional, Tuple, Union, List
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import OPTPreTrainedModel, OPTModel
-
-import torch
-import torch.nn as nn
-
-
-class OPTForCausalLM(OPTPreTrainedModel):
+class Phi3ForCausalLM(Phi3PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.__init__ with Llama->Phi3
     def __init__(self, config):
         super().__init__(config)
-        self.model = OPTModel(config)
-
-        # the lm_head weight is automatically tied to the embed tokens weight
+        self.model = Phi3Model(config)
+        self.vocab_size = config.vocab_size
         self.bit_size = torch.log2(torch.tensor(config.vocab_size)).ceil().int().item()
-        self.lm_head = nn.Sequential(
-            nn.Linear(config.word_embed_proj_dim, self.bit_size, bias=False),
-            # nn.Sigmoid(),  not to be used with BCEWithLogitsLoss
-        )
+        self.lm_head = (nn.Linear(config.hidden_size, self.bit_size, bias=False),)
 
         # Initialize weights and apply final processing
         self.post_init()
 
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.get_input_embeddings
     def get_input_embeddings(self):
-        return self.model.decoder.embed_tokens
+        return self.model.embed_tokens
 
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.set_input_embeddings
     def set_input_embeddings(self, value):
-        self.model.decoder.embed_tokens = value
+        self.model.embed_tokens = value
 
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.get_output_embeddings
     def get_output_embeddings(self):
         return self.lm_head
 
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.set_output_embeddings
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.set_decoder
     def set_decoder(self, decoder):
-        self.model.decoder = decoder
+        self.model = decoder
 
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.get_decoder
     def get_decoder(self):
-        return self.model.decoder
+        return self.model
 
-    def int_to_bin_tensor(self, val):
-        length = self.bit_size
-        bin_str = format(val, "0" + str(length) + "b")
-        bin_tensor = torch.tensor([int(bit) for bit in bin_str])
-        return bin_tensor
-
+    # Ignore copy
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -81,7 +78,6 @@ class OPTForCausalLM(OPTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        r""" """
 
         output_attentions = (
             output_attentions
@@ -98,10 +94,10 @@ class OPTForCausalLM(OPTPreTrainedModel):
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model.decoder(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            head_mask=head_mask,
+            position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
@@ -110,25 +106,22 @@ class OPTForCausalLM(OPTPreTrainedModel):
             return_dict=return_dict,
         )
 
-        logits = self.lm_head(outputs[0]).contiguous()  # (bs, seq_length, bit_size)
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states)
+        logits = logits.float()
 
         loss = None
         if labels is not None:
-            labels = labels.to(logits.device)
+            # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-
-            # convert the labels to binary - currently they are indexes of the tokenizer
-            binary_tensors = [
-                self.int_to_bin_tensor(val.item()) for val in shift_labels.flatten()
-            ]
-            # get the binary tokens in the same shape as the original tensor
-            binary_tensors = torch.stack(binary_tensors).view(*shift_labels.shape, -1)
-            binary_tensors = binary_tensors.to(logits.device)
-            # add L1 loss
-            # loss_fct = nn.L1Loss()
+            # Flatten the tokens
             loss_fct = nn.BCEWithLogitsLoss()
-            loss = loss_fct(shift_logits.float(), binary_tensors.float())
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -142,6 +135,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
             attentions=outputs.attentions,
         )
 
+    # Copied from transformers.models.persimmon.modeling_persimmon.PersimmonForCausalLM.prepare_inputs_for_generation
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -151,16 +145,44 @@ class OPTForCausalLM(OPTPreTrainedModel):
         **kwargs
     ):
         if past_key_values is not None:
-            past_length = past_key_values[0][0].shape[2]
-
-            # Some generation methods already pass only the last input ID
-            if input_ids.shape[1] > past_length:
-                remove_prefix_length = past_length
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values.seen_tokens
+                max_cache_length = past_key_values.get_max_length()
             else:
-                # Default to old behavior: keep only final ID
-                remove_prefix_length = input_ids.shape[1] - 1
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
 
-            input_ids = input_ids[:, remove_prefix_length:]
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
+            # input)
+            if (
+                attention_mask is not None
+                and attention_mask.shape[1] > input_ids.shape[1]
+            ):
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
@@ -170,6 +192,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
 
         model_inputs.update(
             {
+                "position_ids": position_ids,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
@@ -178,6 +201,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
         return model_inputs
 
     @staticmethod
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM._reorder_cache
     def _reorder_cache(past_key_values, beam_idx):
         reordered_past = ()
         for layer_past in past_key_values:
@@ -190,9 +214,9 @@ class OPTForCausalLM(OPTPreTrainedModel):
         return reordered_past
 
 
-model_name = "facebook/opt-350m"
+model_name = "microsoft/phi-3-mini-4k-instruct"
 dataset_name = "tatsu-lab/alpaca"
-new_model = "opt-350m-alpaca-bce"
+new_model = "phi-3-mini-alpaca-bce"
 
 # LoRA attention dimension
 lora_r = 64
@@ -298,7 +322,7 @@ if compute_dtype == torch.float16 and use_4bit:
         print("=" * 80)
 
 
-model = OPTForCausalLM.from_pretrained(
+model = Phi3ForCausalLM.from_pretrained(
     model_name, quantization_config=bnb_config, device_map=device_map
 )
 
@@ -348,6 +372,7 @@ training_arguments = TrainingArguments(
     group_by_length=group_by_length,
     lr_scheduler_type=lr_scheduler_type,
     report_to=["tensorboard"],
+    save_total_limit=3,
 )
 
 
@@ -367,3 +392,6 @@ trainer.train()
 
 # Save trained model
 trainer.model.save_pretrained(new_model)
+trainer.tokenizer.save_pretrained(new_model)
+trainer.config.save_pretrained(new_model)
+
