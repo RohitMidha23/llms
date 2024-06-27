@@ -1,4 +1,5 @@
-import os 
+import os
+
 os.environ["HF_HOME"] = "/vol/bitbucket/rm1623/.cache/"
 
 import os
@@ -22,7 +23,7 @@ from typing import Optional, Tuple, Union, List
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import OPTPreTrainedModel, OPTModel
 
-import torch 
+import torch
 import torch.nn as nn
 
 
@@ -37,7 +38,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
         self.bit_size = torch.log2(torch.tensor(config.vocab_size)).ceil().int().item()
         self.lm_head = nn.Sequential(
             nn.Linear(config.word_embed_proj_dim, self.bit_size, bias=False),
-            nn.Sigmoid(),
+            # nn.Sigmoid(),  not to be used with BCEWithLogitsLoss
         )
 
         # Initialize weights and apply final processing
@@ -60,10 +61,10 @@ class OPTForCausalLM(OPTPreTrainedModel):
 
     def get_decoder(self):
         return self.model.decoder
-    
+
     def int_to_bin_tensor(self, val):
         length = self.bit_size
-        bin_str = format(val, '0' + str(length) + 'b')
+        bin_str = format(val, "0" + str(length) + "b")
         bin_tensor = torch.tensor([int(bit) for bit in bin_str])
         return bin_tensor
 
@@ -80,14 +81,21 @@ class OPTForCausalLM(OPTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        r"""
-        """
+        r""" """
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.decoder(
@@ -109,16 +117,19 @@ class OPTForCausalLM(OPTPreTrainedModel):
             labels = labels.to(logits.device)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
+
             # convert the labels to binary - currently they are indexes of the tokenizer
-            binary_tensors = [self.int_to_bin_tensor(val.item()) for val in shift_labels.flatten()]
+            binary_tensors = [
+                self.int_to_bin_tensor(val.item()) for val in shift_labels.flatten()
+            ]
             # get the binary tokens in the same shape as the original tensor
             binary_tensors = torch.stack(binary_tensors).view(*shift_labels.shape, -1)
             binary_tensors = binary_tensors.to(logits.device)
             # add L1 loss
-            loss_fct = nn.L1Loss()
-            loss = loss_fct(shift_logits, binary_tensors)
-        
+            # loss_fct = nn.L1Loss()
+            loss_fct = nn.BCEWithLogitsLoss()
+            loss = loss_fct(shift_logits.float(), binary_tensors.float())
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -132,7 +143,12 @@ class OPTForCausalLM(OPTPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs
     ):
         if past_key_values is not None:
             past_length = past_key_values[0][0].shape[2]
@@ -166,14 +182,17 @@ class OPTForCausalLM(OPTPreTrainedModel):
         reordered_past = ()
         for layer_past in past_key_values:
             reordered_past += (
-                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+                tuple(
+                    past_state.index_select(0, beam_idx.to(past_state.device))
+                    for past_state in layer_past
+                ),
             )
         return reordered_past
 
 
 model_name = "facebook/opt-350m"
 dataset_name = "tatsu-lab/alpaca"
-new_model = "opt-350m-alpaca"
+new_model = "opt-350m-alpaca-bce"
 
 # LoRA attention dimension
 lora_r = 64
@@ -243,7 +262,7 @@ warmup_ratio = 0.01
 group_by_length = True
 
 # Save checkpoint every X updates steps
-save_steps = 0
+save_steps = 2000
 
 # Log every X updates steps
 logging_steps = 25
@@ -277,9 +296,11 @@ if compute_dtype == torch.float16 and use_4bit:
         print("=" * 80)
         print("Your GPU supports bfloat16: accelerate training with bf16=True")
         print("=" * 80)
-        
-        
-model = OPTForCausalLM.from_pretrained(model_name, quantization_config=bnb_config, device_map=device_map)
+
+
+model = OPTForCausalLM.from_pretrained(
+    model_name, quantization_config=bnb_config, device_map=device_map
+)
 
 model.config.use_cache = False
 model.config.pretraining_tp = 1
@@ -326,7 +347,7 @@ training_arguments = TrainingArguments(
     warmup_ratio=warmup_ratio,
     group_by_length=group_by_length,
     lr_scheduler_type=lr_scheduler_type,
-    report_to=["tensorboard"]
+    report_to=["tensorboard"],
 )
 
 
